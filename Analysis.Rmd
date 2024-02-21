@@ -1,0 +1,790 @@
+---
+title: "I-Vax Game Analysis"
+output: html_notebook
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+In this notebook we present the results of the implementation of the
+analysis we conducted on our proof-of-concept implementation of the
+interactive vaccination (I-Vax) game presented in our [paper](). We
+refer to the paper for the discussion and presentation of the results.
+
+```{r}
+# Remove annoying warnings
+options(warn=-1)
+#options(warn=0)
+
+# Import libraries
+library("nlme")
+library("plyr")
+library("dplyr")
+library("imputeTS")
+library("lme4")
+
+# For log odds from models
+library("broom.mixed")
+
+# For plots
+library("scales")
+library("sjPlot")
+library("sjmisc")
+library("magrittr")
+library("ggeffects")
+library("splines")
+
+library("ggplot2")
+library("ggfortify")
+library("Greg")
+
+library("survival")
+library("survminer")
+library("lubridate")
+library("coxme")
+
+library("lmtest")
+```
+
+# 1 Data Preparation
+
+Let's prepare the data for the models, starting with the round (waves)
+outcomes.
+
+```{r}
+# Read data
+mydata14 <- read.table("Anonymized Data/end_of_wave_status_1-4.csv", header=TRUE, row.names='X', sep=",")
+mydata14 <- mydata14[!duplicated(mydata14), ] # Remove duplicates if it's the case
+
+mydata58 <- read.table("Anonymized Data/end_of_wave_status_5-8.csv", header=TRUE, row.names='X', sep=",")
+mydata58 <- mydata58[!duplicated(mydata58), ] # Remove duplicates if it's the case
+
+mydata912 <- read.table("Anonymized Data/end_of_wave_status_9-12.csv", header=TRUE, row.names='X', sep=",")
+mydata912 <- mydata912[!duplicated(mydata912), ] # Remove duplicates if it's the case
+```
+
+Let's encode the states:
+
+-   **I** **= 0** as well as **R** **= 0**, since they both represent
+    the fact that the player got infected (even if recovered)
+
+-   **V = 1** and **A = 1**, these are the cases where the user was
+    vaccinated or still awaiting the vaccination
+
+-   **S = 2**, susceptible players
+
+```{r}
+# Apply the function
+mydata14['state'] <- lapply(mydata14['state'], function(x) mapvalues(x, c("I", "R", "V", "A", "S"), c(0, 0, 1, 1, 2)))
+mydata58['state'] <- lapply(mydata58['state'], function(x) mapvalues(x, c("I", "R", "V", "A", "S"), c(0, 0, 1, 1, 2)))
+mydata912['state'] <- lapply(mydata912['state'], function(x) mapvalues(x, c("I", "R", "V", "A", "S"), c(0, 0, 1, 1, 2)))
+```
+
+The next step is to transform the points to dummy points, to ease the
+fit of the models:
+
+-   **0** if there was no point loss
+
+-   **1** if there was point loss
+
+```{r}
+# Function to map values
+dummy_points <- function(points, state){
+  res <- 0
+  if(state == 0){ #Infected
+    if(points == 100)
+      res <- 0
+    else
+      res <- 1
+  } else if (state == 1){ #Vaccinated
+    if(points == 90)
+      res <- 0
+    else
+      res <- 1
+  } else if (state == 2){ #Susceptible
+    res <- 0
+  }
+  
+  return(res)
+}
+
+# Apply it
+mydata14['points'] <- apply(mydata14[,c('points', 'state')], 1, function(x) dummy_points(as.integer(x[1]), as.integer(x[2])))
+mydata58['points'] <- apply(mydata58[,c('points', 'state')], 1, function(x) dummy_points(as.integer(x[1]), as.integer(x[2])))
+mydata912['points'] <- apply(mydata912[,c('points', 'state')], 1, function(x) dummy_points(as.integer(x[1]), as.integer(x[2])))
+
+print(mydata14)
+```
+
+Next we have to combine the information from the subsequent waves to
+have the correct factors. We will also add a control variable which
+indicates which of the **feedback_setting** the round took place into (1
+no feedback, 2 local feedback or 3 global feedback). Finally there will
+be two distinct dataframes, one which contains data from all the the
+rounds (that can therefore only be used without considering the
+feedback) and the other with data from the rounds which had feedback.
+
+```{r}
+# Split data in waves
+wave1 <- mydata14[mydata14['wave_no'] == 1,]
+wave2 <- mydata14[mydata14['wave_no'] == 2,]
+wave3 <- mydata14[mydata14['wave_no'] == 3,]
+wave4 <- mydata14[mydata14['wave_no'] == 4,]
+wave5 <- mydata58[mydata58['wave_no'] == 5,]
+wave6 <- mydata58[mydata58['wave_no'] == 6,]
+wave7 <- mydata58[mydata58['wave_no'] == 7,]
+wave8 <- mydata58[mydata58['wave_no'] == 8,]
+wave9 <- mydata912[mydata912['wave_no'] == 9,]
+wave10 <- mydata912[mydata912['wave_no'] == 10,]
+wave11 <- mydata912[mydata912['wave_no'] == 11,]
+wave12 <- mydata912[mydata912['wave_no'] == 12,]
+
+# Add feedback_setting
+wave1['feedback_setting'] <- 1
+wave2['feedback_setting'] <- 1
+wave3['feedback_setting'] <- 1
+wave4['feedback_setting'] <- 1
+wave5['feedback_setting'] <- 2
+wave6['feedback_setting'] <- 2
+wave7['feedback_setting'] <- 2
+wave8['feedback_setting'] <- 2
+wave9['feedback_setting'] <- 3
+wave10['feedback_setting'] <- 3
+wave11['feedback_setting'] <- 3
+wave12['feedback_setting'] <- 3
+
+# Aggregate data for waves
+train12 <- merge(wave1[c("user", "points", "state", "decision")], wave2[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+train23 <- merge(wave2[c("user", "points", "state", "decision")], wave3[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+train34 <- merge(wave3[c("user", "points", "state", "decision")], wave4[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+
+train45 <- merge(wave4[c("user", "points", "state", "decision")], wave5[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+train56 <- merge(wave5[c("user", "points", "state", "decision")], wave6[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+train67 <- merge(wave6[c("user", "points", "state", "decision")], wave7[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+train78 <- merge(wave7[c("user", "points", "state", "decision")], wave8[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+
+train89 <- merge(wave8[c("user", "points", "state", "decision")], wave9[c("user", "wave_no", "decision", "feedback_setting")],
+                 by="user", suffixes=c("_prev", ""))
+train910 <- merge(wave9[c("user", "points", "state", "decision")], wave10[c("user", "wave_no", "decision", "feedback_setting")],
+                  by="user", suffixes=c("_prev", ""))
+train1011 <- merge(wave10[c("user", "points", "state", "decision")], wave11[c("user", "wave_no", "decision", "feedback_setting")],
+                   by="user", suffixes=c("_prev", ""))
+train1112 <- merge(wave11[c("user", "points", "state", "decision")], wave12[c("user", "wave_no", "decision", "feedback_setting")],
+                   by="user", suffixes=c("_prev", ""))
+
+# Concatenate all information
+train112 <- rbind.fill(train12, train23, train34, train45, train56, train67, train78, train89, train910, train1011, train1112)
+train512 <- rbind.fill(train45, train56, train67, train78, train89, train910, train1011, train1112)
+```
+
+## 1.1 EOW Feedback
+
+Now let's include the EOW (end of wave) feedback. Wave number will be
+increased by 1 since this information is going to be used in the
+subsequent wave (e.g., `vaccinated_eow`).
+
+```{r}
+# Read feedback eow
+eow_feedback5 <- read.table("Anonymized Data/wave5_feedback_eow.csv", header=TRUE, row.names='X', sep=",")
+eow_feedback5['wave_no'] <- 6
+
+eow_feedback6 <- read.table("Anonymized Data/wave6_feedback_eow.csv", header=TRUE, row.names='X', sep=",")
+eow_feedback6['wave_no'] <- 7
+
+eow_feedback7 <- read.table("Anonymized Data/wave7_feedback_eow.csv", header=TRUE, row.names='X', sep=",")
+eow_feedback7['wave_no'] <- 8
+
+eow_feedback8 <- read.table("Anonymized Data/wave8_feedback_eow.csv", header=TRUE, row.names='X', sep=",")
+eow_feedback8['wave_no'] <- 9
+
+eow_feedback9 <- read.table("Anonymized Data/wave9_feedback_eow.csv", header=TRUE, row.names='X', sep=",")
+eow_feedback9['wave_no'] <- 10
+
+eow_feedback10 <- read.table("Anonymized Data/wave10_feedback_eow.csv", header=TRUE, row.names='X', sep=",")
+eow_feedback10['wave_no'] <- 11
+
+eow_feedback11 <- read.table("Anonymized Data/wave11_feedback_eow.csv", header=TRUE, row.names='X', sep=",")
+eow_feedback11['wave_no'] <- 12
+```
+
+We rename the columns, with \*\*\_eow\*\* being the suffix: this is
+important because we are using both local and global feedback and in the
+cumulative analysis we want to put them together. Moreover for the
+global infected feedback we are going to have to add the recovered (they
+were after all infected before recovering).
+
+```{r}
+# Wave 5
+names(eow_feedback5)[names(eow_feedback5) == "vaccinated_interactions"] <- "vaccinated_eow"
+names(eow_feedback5)[names(eow_feedback5) == "infected_interactions"] <- "infected_eow"
+names(eow_feedback5)[names(eow_feedback5) == "recovered_interactions"] <- "recovered_eow"
+names(eow_feedback5)[names(eow_feedback5) == "susceptible_interactions"] <- "susceptible_eow"
+
+# Wave 6
+names(eow_feedback6)[names(eow_feedback6) == "vaccinated_interactions"] <- "vaccinated_eow"
+names(eow_feedback6)[names(eow_feedback6) == "infected_interactions"] <- "infected_eow"
+names(eow_feedback6)[names(eow_feedback6) == "recovered_interactions"] <- "recovered_eow"
+names(eow_feedback6)[names(eow_feedback6) == "susceptible_interactions"] <- "susceptible_eow"
+
+# Wave 7
+names(eow_feedback7)[names(eow_feedback7) == "vaccinated_interactions"] <- "vaccinated_eow"
+names(eow_feedback7)[names(eow_feedback7) == "infected_interactions"] <- "infected_eow"
+names(eow_feedback7)[names(eow_feedback7) == "recovered_interactions"] <- "recovered_eow"
+names(eow_feedback7)[names(eow_feedback7) == "susceptible_interactions"] <- "susceptible_eow"
+
+# Wave 8
+names(eow_feedback8)[names(eow_feedback8) == "vaccinated_interactions"] <- "vaccinated_eow"
+names(eow_feedback8)[names(eow_feedback8) == "infected_interactions"] <- "infected_eow"
+names(eow_feedback8)[names(eow_feedback8) == "recovered_interactions"] <- "recovered_eow"
+names(eow_feedback8)[names(eow_feedback8) == "susceptible_interactions"] <- "susceptible_eow"
+
+# Wave 9
+eow_feedback9$infected_all <- rowSums(eow_feedback9[, c("infected_all", "recovered_all")])
+names(eow_feedback9)[names(eow_feedback9) == "vaccinated_all"] <- "vaccinated_eow"
+names(eow_feedback9)[names(eow_feedback9) == "infected_all"] <- "infected_eow"
+names(eow_feedback9)[names(eow_feedback9) == "recovered_all"] <- "recovered_eow"
+names(eow_feedback9)[names(eow_feedback9) == "susceptible_all"] <- "susceptible_eow"
+
+# Wave 10
+eow_feedback10$infected_all <- rowSums(eow_feedback10[, c("infected_all", "recovered_all")])
+names(eow_feedback10)[names(eow_feedback10) == "vaccinated_all"] <- "vaccinated_eow"
+names(eow_feedback10)[names(eow_feedback10) == "infected_all"] <- "infected_eow"
+names(eow_feedback10)[names(eow_feedback10) == "recovered_all"] <- "recovered_eow"
+names(eow_feedback10)[names(eow_feedback10) == "susceptible_all"] <- "susceptible_eow"
+
+# Wave 11
+eow_feedback11$infected_all <- rowSums(eow_feedback11[, c("infected_all", "recovered_all")])
+names(eow_feedback11)[names(eow_feedback11) == "vaccinated_all"] <- "vaccinated_eow"
+names(eow_feedback11)[names(eow_feedback11) == "infected_all"] <- "infected_eow"
+names(eow_feedback11)[names(eow_feedback11) == "recovered_all"] <- "recovered_eow"
+names(eow_feedback11)[names(eow_feedback11) == "susceptible_all"] <- "susceptible_eow"
+
+# Finally merge
+eow_feedback512 <- rbind.fill(eow_feedback5, eow_feedback6, eow_feedback7, eow_feedback8, eow_feedback9, eow_feedback10, eow_feedback11)
+
+print(eow_feedback512)
+```
+
+Since we are considering EOW feedback, we cannot consider wave 5: it has
+no feedback coming from wave 4. Still we will need it to create the
+survival data, so we will keep the information for now. Also, because of
+the data gathering, there will be some missing values in the feedbacks:
+these will be filled with the average value, so that their distribution
+can remain as close as possible to the original. Having NAs for wave 5
+won't change the mean outcome.
+
+```{r}
+# Merge the data so far with the EOW feedback
+train_feedback512 <- merge(train512, eow_feedback512[c("user", "wave_no", "vaccinated_eow", "infected_eow", "recovered_eow", "susceptible_eow")],
+                                               by=c("user", "wave_no"), suffixes=c("", "_day"), all.x=TRUE)
+
+# Fill NAs of data
+train_feedback512 <- na_mean(train_feedback512)
+
+print(train_feedback512)
+```
+
+Lastly let's rescale the percentages of the feedback data to
+probabilities (this will help in fitting the models).
+
+```{r}
+# Rescale with a for loop. The apply gave some problems
+for(i in rownames(train_feedback512)) {
+  train_feedback512[i, 8] <- train_feedback512[i, 8]/100
+  train_feedback512[i, 9] <- train_feedback512[i, 9]/100
+  train_feedback512[i, 10] <- train_feedback512[i, 10]/100
+  train_feedback512[i, 11] <- train_feedback512[i, 11]/100
+}
+
+print(train_feedback512)
+```
+
+## 1.3 Round Number
+
+For this analysis we want to see the impact of the feedback on the
+various predictor. For this reason we have to aggregate the analogous
+rounds (e.g. wave 1 with 5 and 9, wave 2 with 6 and 10 and so on...):
+this will allow to really see the effect of the feedback setting. We
+will have to do this for both the complete data and the data with
+feedback.
+
+```{r}
+# Create new copies of the datasets
+train112_ready <- train112
+train512_ready <- train_feedback512
+
+# Now apply the mapping
+train112_ready['wave_no_en'] <- lapply(train112['wave_no'], function(x) mapvalues(x, c(5,6,7,8,9,10,11,12), c(1,2,3,4,1,2,3,4)))
+train512_ready['wave_no_en'] <- lapply(train_feedback512['wave_no'], function(x) mapvalues(x, c(5,6,7,8,9,10,11,12), c(1,2,3,4,1,2,3,4)))
+print(train512_ready)
+```
+
+## 1.4 Add Daily Feedback
+
+We need to prepare the data for the survival analysis as well. We will
+first need to read every feedback and rename the columns as before.
+
+```{r}
+# Read all feedback data
+all_feedback5 <- read.table("Anonymized Data/wave5_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+all_feedback6 <- read.table("Anonymized Data/wave6_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+all_feedback7 <- read.table("Anonymized Data/wave7_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+all_feedback8 <- read.table("Anonymized Data/wave8_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+all_feedback9 <- read.table("Anonymized Data/wave9_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+all_feedback10 <- read.table("Anonymized Data/wave10_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+all_feedback11 <- read.table("Anonymized Data/wave11_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+all_feedback12 <- read.table("Anonymized Data/wave12_every_feedback.csv", header=TRUE, row.names='X', sep=",")
+```
+
+```{r}
+# Wave 5
+names(all_feedback5)[names(all_feedback5) == "vaccinated_interactions"] <- "vaccinated_surv"
+names(all_feedback5)[names(all_feedback5) == "infected_interactions"] <- "infected_surv"
+names(all_feedback5)[names(all_feedback5) == "recovered_interactions"] <- "recovered_surv"
+names(all_feedback5)[names(all_feedback5) == "susceptible_interactions"] <- "susceptible_surv"
+
+# Wave 6
+names(all_feedback6)[names(all_feedback6) == "vaccinated_interactions"] <- "vaccinated_surv"
+names(all_feedback6)[names(all_feedback6) == "infected_interactions"] <- "infected_surv"
+names(all_feedback6)[names(all_feedback6) == "recovered_interactions"] <- "recovered_surv"
+names(all_feedback6)[names(all_feedback6) == "susceptible_interactions"] <- "susceptible_surv"
+
+# Wave 7
+names(all_feedback7)[names(all_feedback7) == "vaccinated_interactions"] <- "vaccinated_surv"
+names(all_feedback7)[names(all_feedback7) == "infected_interactions"] <- "infected_surv"
+names(all_feedback7)[names(all_feedback7) == "recovered_interactions"] <- "recovered_surv"
+names(all_feedback7)[names(all_feedback7) == "susceptible_interactions"] <- "susceptible_surv"
+
+# Wave 8
+names(all_feedback8)[names(all_feedback8) == "vaccinated_interactions"] <- "vaccinated_surv"
+names(all_feedback8)[names(all_feedback8) == "infected_interactions"] <- "infected_surv"
+names(all_feedback8)[names(all_feedback8) == "recovered_interactions"] <- "recovered_surv"
+names(all_feedback8)[names(all_feedback8) == "susceptible_interactions"] <- "susceptible_surv"
+
+# Wave 9
+names(all_feedback9)[names(all_feedback9) == "vaccinated_all"] <- "vaccinated_surv"
+names(all_feedback9)[names(all_feedback9) == "infected_all"] <- "infected_surv"
+names(all_feedback9)[names(all_feedback9) == "recovered_all"] <- "recovered_surv"
+names(all_feedback9)[names(all_feedback9) == "susceptible_all"] <- "susceptible_surv"
+
+# Wave 10
+names(all_feedback10)[names(all_feedback10) == "vaccinated_all"] <- "vaccinated_surv"
+names(all_feedback10)[names(all_feedback10) == "infected_all"] <- "infected_surv"
+names(all_feedback10)[names(all_feedback10) == "recovered_all"] <- "recovered_surv"
+names(all_feedback10)[names(all_feedback10) == "susceptible_all"] <- "susceptible_surv"
+
+# Wave 11
+names(all_feedback11)[names(all_feedback11) == "vaccinated_all"] <- "vaccinated_surv"
+names(all_feedback11)[names(all_feedback11) == "infected_all"] <- "infected_surv"
+names(all_feedback11)[names(all_feedback11) == "recovered_all"] <- "recovered_surv"
+names(all_feedback11)[names(all_feedback11) == "susceptible_all"] <- "susceptible_surv"
+
+# Wave 12
+names(all_feedback12)[names(all_feedback12) == "vaccinated_all"] <- "vaccinated_surv"
+names(all_feedback12)[names(all_feedback12) == "infected_all"] <- "infected_surv"
+names(all_feedback12)[names(all_feedback12) == "recovered_all"] <- "recovered_surv"
+names(all_feedback12)[names(all_feedback12) == "susceptible_all"] <- "susceptible_surv"
+
+# Merge them all
+all_feedback512 <- rbind.fill(all_feedback5, all_feedback6, all_feedback7, all_feedback8, all_feedback9, all_feedback10, all_feedback11, all_feedback12)
+all_feedback512 <- na_mean(all_feedback512)
+```
+
+For the survival analysis we want to have only one feedback per user per
+wave. This means that for the vaccinated it's easy, since we'll just
+keep the day in which they vaccinated (where there is the feedback of
+the day before). For the non-vaccinated, instead, we will keep the last
+day of the week, as it was the last occasion they had to vaccinate
+(after that there is **censoring** and it's important to consider this
+data).
+
+```{r}
+# Divide between vaccinated and non-vaccinated
+all_feedback512_vax <- all_feedback512[all_feedback512['vaccinated']==1, ]
+all_feedback512_inf <- all_feedback512[all_feedback512['is_infected']==1, ]
+all_feedback512_novax <- all_feedback512[(all_feedback512['vaccinated']==0) & (all_feedback512['is_infected']==0), ]
+
+# Remove duplicates from vaccinated keeping only the first day (default distinct behaviour)
+all_feedback512_nodup <- distinct(.data=all_feedback512_vax, user, wave_no, .keep_all=TRUE)
+
+# Do the same with infected
+all_feedback512_nodup_inf <- distinct(.data=all_feedback512_inf, user, wave_no, .keep_all=TRUE)
+
+# Remove the unnecessary entries for non-vaccinated
+# The infected and vaccinated that might be here will not be here anymore, as all the days before vaccination/infection are removed with this
+novax <- all_feedback512_novax[all_feedback512_novax['day']==7, ]
+
+# Put them together again
+train_surv512 <- rbind.fill(novax, all_feedback512_nodup, all_feedback512_nodup_inf)
+
+print(train_surv512)
+```
+
+As last step we need now to merge this with the previous information
+(wave outcome and EOW feedback).
+
+```{r}
+# Keep only the relevant information from surv
+# Keep survival feedback for wave 5 as well
+train_surv512 <- merge(train_surv512[c("user", "wave_no", "day", "vaccinated_surv", "infected_surv", "recovered_surv", "susceptible_surv")],
+                       train512_ready, by=c("user", "wave_no"), suffixes=c("", "_day"))
+
+# Make percentages probabilities
+for(i in rownames(train_surv512)) {
+  train_surv512[i, 4] <- train_surv512[i, 4]/100
+  train_surv512[i, 5] <- train_surv512[i, 5]/100
+  train_surv512[i, 6] <- train_surv512[i, 6]/100
+  train_surv512[i, 7] <- train_surv512[i, 7]/100
+}
+
+
+print(train_surv512)
+```
+
+## 1.5 Make Variables Categorical
+
+Now we need to transform the variable that are not numerical into
+categorical. This is theoretically more correct and will allow to see
+directly from the model the difference between a baseline condition and
+the possible different values of the covariates.
+
+The ones we can make categorical are: **points** (point loss and no
+loss), **decision_prev** (vaccination or no vaccination) and
+**feedback_setting**. The outcome will stay as it is as the logistic
+model allows us to predict the probability towards vaccination. We will
+also order these categories, because when training the models R takes
+the first one as the baseline to compare the others.
+
+Instead, for what regards **decision** we want to leave it numerical: in
+this way the model will treat it like probabilities and return us the
+probability of getting vaccinated.
+
+```{r}
+# WHOLE DATASET
+train112_readyc <- train112_ready
+
+# Handle points
+train112_readyc$points[train112_readyc['points']==1] <- "Loss"
+train112_readyc$points[train112_readyc['points']==0] <- "NoLoss"
+
+# Handle decision_prev
+train112_readyc$decision_prev[train112_readyc['decision_prev']==1] <- "Vaccination"
+train112_readyc$decision_prev[train112_readyc['decision_prev']==0] <- "NoVaccination"
+
+# Handle feedback_setting
+train112_readyc$feedback_setting[train112_readyc['feedback_setting']==1] <- "NoFeedback"
+train112_readyc$feedback_setting[train112_readyc['feedback_setting']==2] <- "Local"
+train112_readyc$feedback_setting[train112_readyc['feedback_setting']==3] <- "Global"
+
+# Also order the values
+train112_readyc$points = factor(train112_readyc$points, levels=c("NoLoss", "Loss"))
+train112_readyc$decision_prev = factor(train112_readyc$decision_prev, levels=c("NoVaccination", "Vaccination"))
+train112_readyc$feedback_setting = factor(train112_readyc$feedback_setting, levels=c("NoFeedback", "Local", "Global"))
+
+print(train112_readyc)
+```
+
+```{r}
+# SETTINGS WITH FEEDBACK (For Survival)
+train512_readyc <- train_surv512
+
+# Handle points
+train512_readyc$points[train512_readyc['points']==1] <- "Loss"
+train512_readyc$points[train512_readyc['points']==0] <- "NoLoss"
+
+# Handle decision_prev
+train512_readyc$decision_prev[train512_readyc['decision_prev']==1] <- "Vaccination"
+train512_readyc$decision_prev[train512_readyc['decision_prev']==0] <- "NoVaccination"
+
+# Handle feedback_setting
+train512_readyc$feedback_setting[train512_readyc['feedback_setting']==1] <- "NoFeedback"
+train512_readyc$feedback_setting[train512_readyc['feedback_setting']==2] <- "Local"
+train512_readyc$feedback_setting[train512_readyc['feedback_setting']==3] <- "Global"
+
+# Also order the values
+train512_readyc$points = factor(train512_readyc$points, levels=c("NoLoss", "Loss"))
+train512_readyc$decision_prev = factor(train512_readyc$decision_prev, levels=c("NoVaccination", "Vaccination"))
+train512_readyc$feedback_setting = factor(train512_readyc$feedback_setting, levels=c("NoFeedback", "Local", "Global"))
+
+print(train512_readyc)
+```
+
+## 1.6 Center Variables
+
+Since we are treating some predictors that could've been problematic as
+categorical, it is now possible to center the other variables. This
+should allow for a better fit of the models, meaning better capturing of
+the significant effects.
+
+**Group mean centering** would be ideal in a setting with random
+effects, but there are not enough measurements for each user. We will
+then use **grand mean centering**, which only consists in subtracting
+the overall mean of the variable to each of its values (but at a
+feedback condition level).
+
+```{r}
+# For survival feedback
+vax_surv_mean2 <- mean(train512_readyc[train512_readyc['feedback_setting']==2,][['vaccinated_surv']], na.rm=TRUE)
+vax_surv_mean3 <- mean(train512_readyc[train512_readyc['feedback_setting']==3,][['vaccinated_surv']], na.rm=TRUE)
+inf_surv_mean2 <- mean(train512_readyc[train512_readyc['feedback_setting']==2,][['infected_surv']], na.rm=TRUE)
+inf_surv_mean3 <- mean(train512_readyc[train512_readyc['feedback_setting']==3,][['infected_surv']], na.rm=TRUE)
+susc_surv_mean2 <- mean(train512_readyc[train512_readyc['feedback_setting']==2,][['susceptible_surv']], na.rm=TRUE)
+susc_surv_mean3 <- mean(train512_readyc[train512_readyc['feedback_setting']==3,][['susceptible_surv']], na.rm=TRUE)
+
+# For EOW feedback
+vax_eow_mean2 <- mean(train512_readyc[train512_readyc['feedback_setting']==2,][['vaccinated_eow']], na.rm=TRUE)
+vax_eow_mean3 <- mean(train512_readyc[train512_readyc['feedback_setting']==3,][['vaccinated_eow']], na.rm=TRUE)
+inf_eow_mean2 <- mean(train512_readyc[train512_readyc['feedback_setting']==2,][['infected_eow']], na.rm=TRUE)
+inf_eow_mean3 <- mean(train512_readyc[train512_readyc['feedback_setting']==3,][['infected_eow']], na.rm=TRUE)
+susc_eow_mean2 <- mean(train512_readyc[train512_readyc['feedback_setting']==2,][['susceptible_eow']], na.rm=TRUE)
+susc_eow_mean3 <- mean(train512_readyc[train512_readyc['feedback_setting']==3,][['susceptible_eow']], na.rm=TRUE)
+
+# Subtract the mean from each element
+train512_readyc[train512_readyc['feedback_setting']==2,]['vaccinated_surv'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==2,]['vaccinated_surv'], function(x) x - vax_surv_mean2)
+train512_readyc[train512_readyc['feedback_setting']==3,]['vaccinated_surv'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==3,]['vaccinated_surv'], function(x) x - vax_surv_mean3)
+
+train512_readyc[train512_readyc['feedback_setting']==2,]['infected_surv'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==2,]['infected_surv'], function(x) x - inf_surv_mean2)
+train512_readyc[train512_readyc['feedback_setting']==3,]['infected_surv'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==3,]['infected_surv'], function(x) x - inf_surv_mean3)
+
+train512_readyc[train512_readyc['feedback_setting']==2,]['susceptible_surv'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==2,]['susceptible_surv'], function(x) x - susc_surv_mean2)
+train512_readyc[train512_readyc['feedback_setting']==3,]['susceptible_surv'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==3,]['susceptible_surv'], function(x) x - susc_surv_mean3)
+
+# EOW
+train512_readyc[train512_readyc['feedback_setting']==2,]['vaccinated_eow'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==2,]['vaccinated_eow'], function(x) x - vax_eow_mean2)
+train512_readyc[train512_readyc['feedback_setting']==3,]['vaccinated_eow'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==3,]['vaccinated_eow'], function(x) x - vax_eow_mean3)
+
+train512_readyc[train512_readyc['feedback_setting']==2,]['infected_eow'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==2,]['infected_eow'], function(x) x - inf_eow_mean2)
+train512_readyc[train512_readyc['feedback_setting']==3,]['infected_eow'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==3,]['infected_eow'], function(x) x - inf_eow_mean3)
+
+train512_readyc[train512_readyc['feedback_setting']==2,]['susceptible_eow'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==2,]['susceptible_eow'], function(x) x - susc_eow_mean2)
+train512_readyc[train512_readyc['feedback_setting']==3,]['susceptible_eow'] <- sapply(train512_readyc[train512_readyc['feedback_setting']==3,]['susceptible_eow'], function(x) x - susc_eow_mean3)
+
+print(head(train512_readyc,10))
+```
+
+# 2 Mixed Effects Analysis
+
+Here we will analyze the impact of the feedback on the predictors that
+are common to all feedback settings. This analysis is centered on
+**self-effects**, meaning that the decision is predicted from
+information about the individual player.
+
+## 2.1 Behaviour Given Individual Outcome in Previous Round
+
+Here we predict users' **decision** given the other effects. We use
+**user** as random effect, to group the observation of the participants.
+
+We also want to introduce a **link function**: the outcome is binary so
+it will be a **logistic link**, which will help to transform the linear
+result into a probability.
+
+This model is reported in the original paper in **TABLE 1** and
+commented in **Section 2.1.**
+
+```{r}
+feedbackImpact <- glmer(decision~(1|user)+points+decision_prev+points:decision_prev+wave_no_en+feedback_setting,
+                       data=train112_readyc, family=binomial(link="logit"),control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(feedbackImpact)
+print(tidy(feedbackImpact,conf.int=TRUE,exponentiate=TRUE,effects="fixed"))
+```
+
+Before analyzing we have to say that since we have categorical values,
+we have a combination of these values used as baseline. The combination
+is such that the baseline is the following: `points=0` (no loss),
+`decision_prev=0` (no vaccination), `feedback_setting=1` (no feedback).
+We have the **intercept** representing this setting.
+
+The coefficient are pretty self explanatory. Once again we refer to the
+paper for an in-depth explanation.
+
+We have the **points:decision_prev** interaction being significant and
+negative. This will be across all the analysis the most important effect
+and we show what happens with the following plot. This is FIGURE 1 of
+the paper.
+
+```{r}
+# Your existing code for generating the plot
+plot_data <- ggpredict(feedbackImpact, c("points", "decision_prev"), alpha = 0.05)
+
+# Create the plot with error bar caps and dodge positioning
+ggplot(plot_data, aes(x = factor(x, levels = unique(x)), y = predicted, ymin = conf.low, ymax = conf.high, color = as.factor(group))) +
+  geom_point(position = position_dodge(width = 0.5), size = 3) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    position = position_dodge(width = 0.5),
+    width = 0.2  # Adjust the width of the error bars
+  ) +
+  ggtitle("Vaccination probabilities given Points and Previous Decision") +
+  ylab("Vaccination Probability") +
+  scale_y_continuous(labels = function(x) format(x, scientific = FALSE)) +
+  xlab("Points") +
+  labs(color="Previous Decision") +
+  #scale_color_manual(values=c("red", "blue")) +
+  theme(legend.position = "bottom",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(),
+    axis.ticks = element_line() #colour = "grey"
+  )
+```
+
+As we can see from the plot it is very clear that the interaction is
+mostly significant when there was no point loss: if the player did
+vaccinate in the previous wave the probability of vaccinating again is
+pretty high, while for if he did not vaccinate the probability is very
+low (and also with a very small variability). When there was point loss,
+instead, there is no substantial difference depending on the previous
+decision.
+
+## 2.2 Behaviour Given Environmental Feedback
+
+Here we will look at the impact of the feedback given to players at the
+end of the rounds (on the number of vaccinated, infected, recovered
+individuals).
+
+We will take the model from Section 2.1 and add the **EOW Feedback**
+(end-of-wave feedback). These feedback will also have an interaction
+with **feedback_setting**, so to control for the *Global* and *Local*
+feedback conditions. We also need to exclude wave 5, as there was no EOW
+feedback coming from wave 4.
+
+This model is reported in the original paper in **TABLE 2** and
+commented in **Section 2.2.**
+
+```{r}
+# Create train for EOW feedback
+train612_readyc <- train512_readyc[train512_readyc['wave_no']>5,]
+
+completeModel <- glmer(decision~(1|user)+points+decision_prev+points:decision_prev+wave_no_en+feedback_setting+vaccinated_eow+
+                         infected_eow+susceptible_eow+vaccinated_eow:feedback_setting+infected_eow:feedback_setting+susceptible_eow:feedback_setting,
+                       data=train612_readyc, family=binomial(link="logit"),control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(completeModel)
+print(tidy(completeModel,conf.int=TRUE,exponentiate=TRUE,effects="fixed"))
+```
+
+We see again the impact of the interaction between previous decision,
+while the environmental feedback did not have a significant impact.
+
+# 3 Survival Analysis
+
+In this section we want to investigate the **daily feedback**. The best
+way to do so is through survival analysis: it allows to model scenarios
+in which there is an event that can happen or not to the subjects
+(usually death, that's why survival) and thus uses the effects to model
+how many survive. In this scenario we will set ***Vaccination*** as the
+decision corresponding to the event of the models. They also take into
+account time and for this, since we look at the daily feedback, we'll
+use the days within waves.
+
+## 3.1 Behaviour Given Daily Feedback
+
+For how the `coxme` library works we now need to encode
+**feedback_setting** so that it only has two values and not all three.
+*Local* will be the baseline again, as in Section 4.1. Also, let's only
+get the data from day 2 (as in day 1 players did not see any daily
+feedback previously).
+
+```{r}
+# Data from day 2
+train512_readyc_noday1 <- train512_readyc[train512_readyc['day']>1,]
+
+# Encode feedback setting with only 2 values
+train512_readyc_noday1$feedback_setting <- factor(train512_readyc_noday1$feedback_setting, levels=c("Local", "Global"))
+```
+
+```{r}
+train512_readyc_noday1
+```
+
+```{r}
+# Go back to percentages. Does not change the model, but easier plots
+
+for(i in rownames(train512_readyc_noday1)) {
+  train512_readyc_noday1[i, 4] <- train512_readyc_noday1[i, 4]*100
+  train512_readyc_noday1[i, 5] <- train512_readyc_noday1[i, 5]*100
+  train512_readyc_noday1[i, 6] <- train512_readyc_noday1[i, 6]*100
+  train512_readyc_noday1[i, 7] <- train512_readyc_noday1[i, 7]*100
+}
+```
+
+We can also use `coxph` which is just a different implementation, but it
+is easier to use to plot the data. The data reported in the paper in
+TABLE 3 is actually the `coxph` model.
+
+```{r}
+cox_feedback <- coxme(Surv(day, decision) ~ (1|user)+points+decision_prev+points:decision_prev+feedback_setting+vaccinated_surv+wave_no_en+
+                        infected_surv+susceptible_surv+feedback_setting:vaccinated_surv+feedback_setting:infected_surv+feedback_setting:susceptible_surv,
+                      data=train512_readyc_noday1)
+summary(cox_feedback)
+confint(cox_feedback, level = 0.95)
+```
+
+```{r}
+cox_feedback_asd <- coxph(Surv(day, decision) ~ frailty(user)+points+decision_prev+points:decision_prev+feedback_setting+vaccinated_surv+wave_no_en+
+                        infected_surv+susceptible_surv+feedback_setting:vaccinated_surv+feedback_setting:infected_surv+feedback_setting:susceptible_surv,
+                      data=train512_readyc_noday1)
+summary(cox_feedback_asd)
+```
+
+Now let's get the confidence intervals for the model.
+
+```{r}
+# Confidence Intervals
+confint(cox_feedback_asd)
+```
+
+Finally, let's plot the most interesting interaction, meaning the one
+between the feedback setting and the susceptible daily feedback. This is
+FIGURE 2 of the paper. The figure above also puts the ribbon for the 95%
+CI, but it hinders the readability of the plot.
+
+```{r}
+data_plt_inf <- ggpredict(cox_feedback_asd, c("susceptible_surv", "feedback_setting"))
+
+# Create the plot
+ggplot(data_plt_inf, aes(x = x, y = predicted)) +
+  geom_line(aes(color = group)) +
+  ylab("Hazard Ratio") +
+  xlab("Percentage of Susceptible") +
+  #scale_y_continuous(limits = c(0, 0.0005)) +# if you want to cut the plot
+  #scale_y_log10() + # If you want the plot in logscale
+  scale_color_discrete(name = "Feedback Setting") +
+  theme_minimal() +  # Use a minimal theme
+  theme(legend.position = "bottom",  # Move the legend to the bottom
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(),
+        axis.ticks = element_line())+
+  coord_cartesian(ylim = c(min(data_plt_inf$predicted), max(0.0005)))  # Set y-axis limit without removing data points
+
+#ggsave("Plots/daily_susc.png", width = 6, height = 4, dpi = 300)
+```
+
+```{r}
+# Create the plot
+ggplot(data_plt_inf, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.2, show.legend = FALSE) +
+  geom_line(aes(color = group)) +
+  ylab("Hazard Ratio") +
+  xlab("Percentage of Susceptible") +
+  scale_y_log10() +
+  scale_color_discrete(name = "Feedback Setting") +
+  theme_minimal() +  # Use a minimal theme
+  theme(legend.position = "bottom",  # Move the legend to the bottom
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(),
+        axis.ticks = element_line())
+
+#ggsave("Plots/daily_susc_err.png", width = 6, height = 4, dpi = 300)
+```
