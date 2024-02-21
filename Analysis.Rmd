@@ -14,10 +14,8 @@ refer to the paper for the discussion and presentation of the results.
 ```{r}
 # Remove annoying warnings
 options(warn=-1)
-#options(warn=0)
 
 # Import libraries
-library("nlme")
 library("plyr")
 library("dplyr")
 library("imputeTS")
@@ -27,23 +25,12 @@ library("lme4")
 library("broom.mixed")
 
 # For plots
-library("scales")
-library("sjPlot")
-library("sjmisc")
-library("magrittr")
 library("ggeffects")
-library("splines")
-
 library("ggplot2")
-library("ggfortify")
-library("Greg")
 
+# Survival
 library("survival")
-library("survminer")
-library("lubridate")
 library("coxme")
-
-library("lmtest")
 ```
 
 # 1 Data Preparation
@@ -743,7 +730,7 @@ confint(cox_feedback_asd)
 
 Finally, let's plot the most interesting interaction, meaning the one
 between the feedback setting and the susceptible daily feedback. This is
-FIGURE 2 of the paper. The figure above also puts the ribbon for the 95%
+FIGURE 2 of the paper. The figure below also puts the ribbon for the 95%
 CI, but it hinders the readability of the plot.
 
 ```{r}
