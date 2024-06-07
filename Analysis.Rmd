@@ -27,6 +27,8 @@ library("broom.mixed")
 # For plots
 library("ggeffects")
 library("ggplot2")
+library("survminer")
+library("cowplot")
 
 # Survival
 library("survival")
@@ -728,6 +730,55 @@ Now let's get the confidence intervals for the model.
 confint(cox_feedback_asd)
 ```
 
+Next we want to display the overall outcome of the model. We can show it
+with the survival curve, also by dividing the two different feedback
+conditions, i.e., local feedback and global feedback. We see that if we
+don't consider day 1, in which most of the vaccinations happen, the
+unvaccinated remain the majority and there is no day with a way bigger
+amount of vaccinations than another, and no significant difference
+between the conditions.
+
+```{r}
+# Create the survival curve object, stratifying by feedback_setting directly
+surv_fit <- survfit(Surv(day, decision) ~ feedback_setting, data = train512_readyc_noday1)
+
+# Plot the survival curves
+plt <- ggsurvplot(
+  surv_fit,
+  data = train512_readyc_noday1,
+  xlab = "Day of Round",
+  ylab = "Unvaccinated Players",
+  ggtheme = theme_minimal() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()),
+  risk.table = TRUE,          # Add a risk table
+  risk.table.title = "Unvaccinated Players", # Change table title
+  conf.int = TRUE,            # Add confidence intervals
+  ylim = c(0.8, 1.0),         # Limits for readability
+  xlim = c(1,7),              # Limits for readability
+  legend.title = "Feedback Setting",
+  legend.labs = levels(train512_readyc_noday1$feedback_setting)
+)
+
+# Add main axes only in the plot
+plt$plot <- plt$plot +
+  scale_x_continuous(breaks = seq(0, 7, by = 1)) +
+  theme(legend.position = "bottom",axis.line = element_line())
+
+# Extract the plot and the risk table
+surv_plot <- plt$plot
+risk_table <- plt$table
+
+# Combine the plot and the risk table using cowplot
+combined_plot <- plot_grid(
+  surv_plot, risk_table, 
+  ncol = 1, 
+  rel_heights = c(3, 1)  # Adjust the relative heights as needed
+)
+
+print(combined_plot)
+```
+
 Finally, let's plot the most interesting interaction, meaning the one
 between the feedback setting and the susceptible daily feedback. This is
 FIGURE 2 of the paper. The figure below also puts the ribbon for the 95%
@@ -736,11 +787,20 @@ CI, but it hinders the readability of the plot.
 ```{r}
 data_plt_inf <- ggpredict(cox_feedback_asd, c("susceptible_surv", "feedback_setting"))
 
+# Function for the y axis formatting
+scientific_10 = function(x) {
+  ifelse(
+    x==0, "0",
+    parse(text = sub("e[+]?", " %*% 10^", scales::scientific_format()(x)))
+  )
+} 
+
 # Create the plot
 ggplot(data_plt_inf, aes(x = x, y = predicted)) +
   geom_line(aes(color = group)) +
   ylab("Hazard Ratio") +
   xlab("Percentage of Susceptible") +
+  scale_y_continuous(labels = scientific_10) +
   #scale_y_continuous(limits = c(0, 0.0005)) +# if you want to cut the plot
   #scale_y_log10() + # If you want the plot in logscale
   scale_color_discrete(name = "Feedback Setting") +
@@ -752,18 +812,21 @@ ggplot(data_plt_inf, aes(x = x, y = predicted)) +
         axis.line = element_line(),
         axis.ticks = element_line())+
   coord_cartesian(ylim = c(min(data_plt_inf$predicted), max(0.0005)))  # Set y-axis limit without removing data points
-
-#ggsave("Plots/daily_susc.png", width = 6, height = 4, dpi = 300)
 ```
 
 ```{r}
+# Change again (logscale and doesn't need 0)
+scientific_10 <- function(x) {
+  parse(text = gsub("e", " %*% 10^", scales::scientific_format()(x)))
+}
+
 # Create the plot
 ggplot(data_plt_inf, aes(x = x, y = predicted)) +
   geom_ribbon(aes(ymin = conf.low, ymax = conf.high, fill = group), alpha = 0.2, show.legend = FALSE) +
   geom_line(aes(color = group)) +
   ylab("Hazard Ratio") +
   xlab("Percentage of Susceptible") +
-  scale_y_log10() +
+  scale_y_log10(labels = scientific_10) +
   scale_color_discrete(name = "Feedback Setting") +
   theme_minimal() +  # Use a minimal theme
   theme(legend.position = "bottom",  # Move the legend to the bottom
@@ -772,6 +835,4 @@ ggplot(data_plt_inf, aes(x = x, y = predicted)) +
         panel.background = element_blank(),
         axis.line = element_line(),
         axis.ticks = element_line())
-
-#ggsave("Plots/daily_susc_err.png", width = 6, height = 4, dpi = 300)
 ```
