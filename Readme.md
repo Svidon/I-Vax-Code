@@ -2,7 +2,7 @@
 
 ---
 
-This repository contains the data and the code of the analysis for the I-Vax game presented in [this paper](paper link).
+This repository contains the data and the code of the analysis for the I-Vax game presented in [this paper](https://doi.org/10.1371/journal.pdig.0000550).
 
 In the game, the players could take the decision of vaccinating against a fictional disease, which spread through Bluetooth contacts of their smartphones.
 
