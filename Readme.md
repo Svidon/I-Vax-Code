@@ -20,3 +20,22 @@ Given this context, the data in `Anonymized Data` is structured in the following
 The notebook `Analysis.Rmd` contains the code to run the analysis described in the paper, along with some instructions. We also share `Analysis.nb.html` as the HTML version.
 
 The first code cell includes the library dependencies used. The notebook follows the same structure as the paper, with a first part which structures the data so that it is fit for the models used
+
+
+## Reference
+If you find this work useful please cite us as:
+
+```bibtex
+@article{girardini2024using,
+  title={Using smartphones to study vaccination decisions in the wild},
+  author={Girardini, Nicol{\`o} Alessandro and Stopczynski, Arkadiusz and Baranov, Olga and Betsch, Cornelia and Brockmann, Dirk and Lehmann, Sune and B{\"o}hm, Robert},
+  journal={PLOS digital health},
+  volume={3},
+  number={8},
+  pages={e0000550},
+  year={2024},
+  publisher={Public Library of Science San Francisco, CA USA},
+  doi={10.1371/journal.pdig.0000550}
+}
+```
+
